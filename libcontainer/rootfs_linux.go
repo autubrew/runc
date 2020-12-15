@@ -22,8 +22,10 @@ import (
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/utils"
 	libcontainerUtils "github.com/opencontainers/runc/libcontainer/utils"
+	"github.com/opencontainers/runc/libcontainer/vkernel"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,6 +52,18 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 
 	hasCgroupns := config.Namespaces.Contains(configs.NEWCGROUP)
 	setupDev := needsSetupDev(config)
+
+	// We must mount vkernel module path into container's rootfs before container
+	// process switch into its mount namespace, otherwise runC can't find the module.
+	vkn, err := vkernel.New()
+	if err != nil {
+		return newSystemErrorWithCause(err, "creating vkernel instance")
+	}
+	config.Mounts, err = vkn.ConfigureMountPath(config.Mounts)
+	if err != nil {
+		return newSystemErrorWithCause(err, "configuring vkernel mount path")
+	}
+
 	for _, m := range config.Mounts {
 		for _, precmd := range m.PremountCmds {
 			if err := mountCmd(precmd); err != nil {
@@ -116,6 +130,12 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 	}
 	if err != nil {
 		return newSystemErrorWithCause(err, "jailing process inside rootfs")
+	}
+
+	// After runC call *msMoveRoot*, *pivotRoot* or *chroot*, we now really get into container
+	// process's working space. Initialize vkernel module.
+	if err := vkn.InitVKernel("", 0); err != nil {
+		return errors.Wrap(err, "initVKernel")
 	}
 
 	if setupDev {
